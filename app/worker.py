@@ -40,6 +40,8 @@ class DownloadWorker(threading.Thread):
             return False
 
     def run(self):
+        _done_sent = False
+        ok = 0; err = 0
         try:
             import yt_dlp
         except ImportError:
@@ -145,4 +147,16 @@ class DownloadWorker(threading.Thread):
             if callable(self.done_fn):
                 try: self.done_fn(self.mode, list(self._completed_files), ok, err, self.outdir)
                 except Exception: pass
+                else:
+                    _done_sent = True
             self.rc=0
+
+        # Garante callback mesmo em exceções anteriores (sem remover logs). 
+        try:
+            pass  # marcador de final
+        finally:
+            try:
+                if (not _done_sent) and callable(self.done_fn):
+                    self.done_fn(self.mode, list(self._completed_files), ok, err, self.outdir)
+            except Exception:
+                pass

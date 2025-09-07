@@ -60,6 +60,28 @@ class App(tk.Tk):
         self.logger, self.log_path = setup_logger(self.log_dir.get(), self.txt_log, name="downloadsfb")
         self.logger.info("ffmpeg: %s", bundled_ffmpeg_path())
         self.logger.info("ffprobe: %s", bundled_ffprobe_path())
+        
+        # Watchdog para liberar worker e manter UI pronta entre execuções
+        def _watchdog():
+            try:
+                if getattr(self, "worker", None) and (not self.worker.is_alive()):
+                    self.worker = None
+            except Exception:
+                self.worker = None
+            try:
+                # Se terminou e a label não voltou ao estado ocioso, ajusta
+                if hasattr(self, "lbl_status") and isinstance(self.lbl_status, ttk.Label):
+                    txt = self.lbl_status.cget("text") or ""
+                    if "Aguardando" not in txt and (getattr(self, "worker", None) is None):
+                        try:
+                            from .i18n import tr
+                            self.lbl_status.configure(text=tr("Aguardando…"))
+                        except Exception:
+                            self.lbl_status.configure(text="Aguardando…")
+            except Exception:
+                pass
+            self.after(1000, _watchdog)
+        self.after(1500, _watchdog)
         self.logger.info("Aplicativo iniciado. Pastas padrão: Áudio=%s | Vídeo=%s | Logs=%s",
                          self.audio_out.get(), self.video_out.get(), self.log_dir.get())
 
@@ -290,6 +312,8 @@ class App(tk.Tk):
         ttk.Button(top_run, text="Iniciar Download Áudio", command=self.start_audio).pack(side="left", padx=4)
         ttk.Button(top_run, text="Iniciar Download Vídeo", command=self.start_video).pack(side="left", padx=4)
         ttk.Button(top_run, text="Parar", command=self.stop_worker).pack(side="left", padx=12)
+        ttk.Button(top_run, text="Reiniciar sessão", command=self.reset_session).pack(side="left", padx=12)
+        ttk.Button(top_run, text="Reiniciar processo", command=lambda: self.reset_all(confirm=True)).pack(side="left", padx=6)
         ttk.Button(top_run, text="Abrir pasta Áudio", command=self.open_audio_folder).pack(side="left", padx=12)
         ttk.Button(top_run, text="Abrir pasta Vídeo", command=self.open_video_folder).pack(side="left", padx=6)
         ttk.Button(top_run, text="Abrir pasta de Logs", command=self.open_logs).pack(side="left", padx=12)
@@ -336,6 +360,34 @@ class App(tk.Tk):
             messagebox.showinfo("Copiado", msg_ok)
         except Exception as e:
             messagebox.showerror("Erro", "Não foi possível copiar.\n%s" % e)
+
+    def _ask_device_action(self, d, fs):
+        """
+        Pergunta ao usuário qual ação tomar ao usar o dispositivo removível.
+        Opções: formatar (apaga tudo) / apenas adicionar / cancelar.
+        Não remove nenhuma função ou log existente; só direciona o fluxo.
+        """
+        try:
+            from .i18n import tr
+        except Exception:
+            def tr(s): return s
+        win = tk.Toplevel(self)
+        win.title(tr("Ação no dispositivo"))
+        info = f"{d['letter']} ({(d.get('label') or tr('Sem rótulo'))}) — {(fs or '?')}"
+        ttk.Label(win, text=tr("Escolha o que deseja fazer no dispositivo:")).pack(padx=12, pady=(12,4), anchor="w")
+        ttk.Label(win, text=info).pack(padx=12, pady=(0,8), anchor="w")
+        ttk.Label(win, text=tr("• Formatar (apaga tudo): garante FAT32 e limpa o dispositivo.")).pack(padx=16, anchor="w")
+        ttk.Label(win, text=tr("• Apenas adicionar: mantém o conteúdo existente e só copia os novos arquivos.")).pack(padx=16, pady=(0,8), anchor="w")
+        res = {"choice": None}
+        def _fmt(): res["choice"] = "format"; win.destroy()
+        def _add(): res["choice"] = "add"; win.destroy()
+        def _cancel(): res["choice"] = None; win.destroy()
+        btns = ttk.Frame(win); btns.pack(fill="x", padx=12, pady=12)
+        ttk.Button(btns, text=tr("Formatar (apagar tudo)"), command=_fmt).pack(side="left", padx=6)
+        ttk.Button(btns, text=tr("Apenas adicionar"), command=_add).pack(side="left", padx=6)
+        ttk.Button(btns, text=tr("Cancelar"), command=_cancel).pack(side="left", padx=6)
+        win.transient(self); win.grab_set(); self.wait_window(win)
+        return res["choice"]
 
     def browse_audio_out(self):
         p = filedialog.askdirectory(title="Selecionar pasta de saída (Áudio)")
@@ -809,9 +861,101 @@ class App(tk.Tk):
         self.open_folder(self.video_out.get())
 
     def open_logs(self):
+
+
+    def reset_session(self):
+        """Reinicia o estado da interface para permitir um novo processo sem reabrir o app.
+        Não remove funções, logs ou comentários existentes — apenas redefine controles visuais e flags."""
+        try:
+            # Zera progresso/label
+            if hasattr(self, "progress"):
+                self.progress["value"] = 0
+            if hasattr(self, "lbl_status"):
+                try:
+                    from .i18n import tr
+                    self.lbl_status.configure(text=tr("Aguardando…"))
+                except Exception:
+                    self.lbl_status.configure(text="Aguardando…")
+        except Exception:
+            pass
+        # Limpa seleções das filas (conteúdo é preservado)
+        try:
+            if hasattr(self, "lst_audio"):
+                self.lst_audio.selection_clear(0, "end")
+            if hasattr(self, "lst_video"):
+                self.lst_video.selection_clear(0, "end")
+        except Exception:
+            pass
+        # Para barras de progresso auxiliares e limpa mensagens
+        for name in ("pg_mb", "pg_gen"):
+            try:
+                getattr(self, name).stop()
+            except Exception:
+                pass
+        for name in ("lbl_mb", "lbl_gen"):
+            try:
+                getattr(self, name).configure(text="")
+            except Exception:
+                pass
+        # Libera referência do worker para permitir novo start
+        try:
+            if getattr(self, "worker", None) and not self.worker.is_alive():
+                self.worker = None
+        except Exception:
+            self.worker = None
+        # Marca como pronto
+        try:
+            self.logger.info("Interface reiniciada. Pronta para um novo processo.")
+        except Exception:
+            pass
+
         self.open_folder(self.log_dir.get())
 
-    def _on_worker_done(self, mode, files, ok, err, outdir):
+    
+
+        def _show():
+            if files:
+                try:
+                    self.last_downloaded_files.extend(files)
+                except Exception:
+                    pass
+                try:
+                    preview = "\\n".join("• " + (os.path.relpath(f, outdir) if (f or "").startswith(outdir) else os.path.basename(f)) for f in files[:20])
+                except Exception:
+                    preview = "\\n".join("• " + os.path.basename(f) for f in files[:20])
+                suffix = "" if len(files) <= 20 else "\\n… e mais %d arquivos." % (len(files) - 20)
+                messagebox.showinfo(tr("Concluído — %s") % mode.upper(),
+                                    (tr("Sucesso: %d | Falhas: %d") + "\\n" + tr("Pasta: %s") + "\\n\\n" + tr("Arquivos baixados (%d):") + "\\n\\n%s%s")
+                                    % (ok, err, outdir, len(files), preview, suffix))
+                messagebox.showinfo(tr("Concluído — %s") % mode.upper(),
+                                    (tr("Sucesso: %d | Falhas: %d") + "
+" + tr("Nenhum arquivo listado.")) % (ok, err))
+            try:
+                if self.auto_open_folder.get() or messagebox.askyesno(tr("Concluído — %s") % mode.upper(), tr("Deseja abrir a pasta dos arquivos agora?")):
+                    try:
+                        os.startfile(outdir)
+                    except Exception:
+                        webbrowser.open(outdir)
+            except Exception:
+                pass
+        try:
+            def _reset():
+            try:
+                self.reset_session()
+            finally:
+                pass
+        self.after(0, _show)
+        self.after(0, _reset)
+        except Exception:
+            _show()
+        # Limpeza mínima de estado p/ próxima execução
+        try:
+            self.worker = None
+            self.progress["value"] = 0
+            self.lbl_status.configure(text=tr("Aguardando…"))
+        except Exception:
+            pass
+
         def _show():
             if files:
                 try:
@@ -830,7 +974,13 @@ class App(tk.Tk):
                     self.open_folder(outdir)
             except Exception:
                 pass
+        def _reset():
+            try:
+                self.reset_session()
+            finally:
+                pass
         self.after(0, _show)
+        self.after(0, _reset)
 
     def play_last_downloaded(self):
         if not self.last_downloaded_files:
@@ -854,6 +1004,8 @@ class App(tk.Tk):
         if getattr(self,"worker",None) and self.worker.is_alive():
             messagebox.showinfo("Execução","Já existe uma execução em andamento.")
             return
+        if getattr(self,"worker",None) and not self.worker.is_alive():
+            self.worker = None
         items = [self.lst_audio.get(i) for i in range(self.lst_audio.size())]
         if not items:
             messagebox.showwarning("Fila vazia","Adicione itens à fila de Áudio.")
@@ -867,6 +1019,8 @@ class App(tk.Tk):
         if getattr(self,"worker",None) and self.worker.is_alive():
             messagebox.showinfo("Execução","Já existe uma execução em andamento.")
             return
+        if getattr(self,"worker",None) and not self.worker.is_alive():
+            self.worker = None
         items = [self.lst_video.get(i) for i in range(self.lst_video.size())]
         if not items:
             messagebox.showwarning("Fila vazia","Adicione itens à fila de Vídeo.")
@@ -882,6 +1036,179 @@ class App(tk.Tk):
             self.worker.stop()
         else:
             self.logger.info("Nenhuma execução ativa.")
+            try:
+                if getattr(self, "worker", None) and (not self.worker.is_alive()):
+                    self.worker = None
+            except Exception:
+                pass
+    def reset_all(self, confirm=False):
+        """
+        Reinicia o aplicativo ao estado inicial: limpa filas, resultados, progresso, status,
+        recria a sessão de log e permite novo download sem precisar fechar o programa.
+        Não remove funções/logs/comentários originais.
+        """
+        try:
+            if confirm and not messagebox.askyesno(tr("Atenção"), tr("Deseja reiniciar todos os campos e listas agora?")):
+                return
+        except Exception:
+            pass
+        # Parar qualquer worker ativo
+        try:
+            if getattr(self, "worker", None) and self.worker.is_alive():
+                self.logger.info("Solicitando parada para reinicialização…")
+                self.worker.stop()
+        except Exception:
+            pass
+        # Resetar ponteiros/estado de execução
+        try:
+            self.worker = None
+            self.progress["value"] = 0
+            self.lbl_status.configure(text=tr("Aguardando…"))
+        except Exception:
+            pass
+        # Progresso de buscas
+        try:
+            self.pg_mb.stop(); self.lbl_mb.configure(text=tr("Parado"))
+        except Exception:
+            pass
+        try:
+            self.pg_gen.stop(); self.lbl_gen.configure(text=tr("Parado"))
+        except Exception:
+            pass
+        # Limpar árvores e marcações
+        try:
+            self.tree.delete(*self.tree.get_children()); self.checked_mb.clear()
+        except Exception:
+            pass
+        try:
+            self.tree_general.delete(*self.tree_general.get_children()); self.checked_gen.clear()
+        except Exception:
+            pass
+        # Limpar filas e caixas de texto
+        try:
+            self.lst_audio.delete(0, "end"); self.lst_video.delete(0, "end")
+        except Exception:
+            pass
+        try:
+            self.txt_urls.delete("1.0", "end")
+        except Exception:
+            pass
+        # Zerar buscas gerais
+        try:
+            self.genre_var.set(""); self.artist_var.set(""); self.title_var.set("")
+            self.general_query_var.set(""); self.last_general_query = None
+        except Exception:
+            pass
+        # Recriar sessão de log
+        try:
+            self.logger, self.log_path = setup_logger(self.log_dir.get(), self.txt_log, name="downloadsfb")
+            self.logger.info("Sessão reiniciada. Logs: %s", self.log_path)
+        except Exception:
+            pass
+        # Reaplicar idioma e atualizar combos (categorias)
+        try:
+            self._apply_language()
+        except Exception:
+            pass
+        # Apenas informa se houver arquivo de histórico (para o usuário decidir apagar manualmente se quiser rebaixar tudo)
+        try:
+            for out in (self.audio_out.get(), self.video_out.get()):
+                hist = os.path.join(out, "baixados.txt")
+                if os.path.isfile(hist):
+                    self.logger.info("Arquivo de histórico localizado (não removido): %s", hist)
+        except Exception:
+            pass
+
+    def _on_worker_done(self, mode, files, ok, err, outdir):
+        """
+        Callback do worker ao finalizar. Mantido original no espírito; acrescenta limpeza mínima
+        de estado para permitir novos processos sem reiniciar o app.
+        """
+        def _show():
+            if files:
+                try:
+                    self.last_downloaded_files.extend(files)
+                except Exception:
+                    pass
+                try:
+                    preview = "\\n".join("• " + (os.path.relpath(f, outdir) if (f or "").startswith(outdir) else os.path.basename(f)) for f in files[:20])
+                except Exception:
+                    preview = "\\n".join("• " + os.path.basename(f) for f in files[:20])
+                suffix = "" if len(files) <= 20 else "\\n… e mais %d arquivos." % (len(files) - 20)
+                messagebox.showinfo(tr("Concluído — %s") % mode.upper(),
+                                    (tr("Sucesso: %d | Falhas: %d") + "\\n" + tr("Pasta: %s") + "\\n\\n" + tr("Arquivos baixados (%d):") + "\\n\\n%s%s")
+                                    % (ok, err, outdir, len(files), preview, suffix))
+            else:
+                messagebox.showinfo(tr("Concluído — %s") % mode.upper(),
+                                    (tr("Sucesso: %d | Falhas: %d") + "\\n" + tr("Nenhum arquivo listado.")) % (ok, err))
+            try:
+                if self.auto_open_folder.get() or messagebox.askyesno(tr("Concluído — %s") % mode.upper(), tr("Deseja abrir a pasta dos arquivos agora?")):
+                    try:
+                        os.startfile(outdir)
+                    except Exception:
+                        webbrowser.open(outdir)
+            except Exception:
+                pass
+        try:
+            def _reset():
+            try:
+                self.reset_session()
+            finally:
+                pass
+        self.after(0, _show)
+        self.after(0, _reset)
+        except Exception:
+            _show()
+        # Limpeza mínima de estado p/ próxima execução
+        try:
+            self.worker = None
+            self.progress["value"] = 0
+            self.lbl_status.configure(text=tr("Aguardando…"))
+        except Exception:
+            pass
+
+        def _show():
+            if files:
+                try:
+                    self.last_downloaded_files.extend(files)
+                except Exception:
+                    pass
+                try:
+                    preview = "\\n".join("• " + (os.path.relpath(f, outdir) if (f or "").startswith(outdir) else os.path.basename(f)) for f in files[:20])
+                except Exception:
+                    preview = "\\n".join("• " + os.path.basename(f) for f in files[:20])
+                suffix = "" if len(files) <= 20 else "\\n… e mais %d arquivos." % (len(files) - 20)
+                messagebox.showinfo(tr("Concluído — %s") % mode.upper(),
+                                    (tr("Sucesso: %d | Falhas: %d") + "\\n" + tr("Pasta: %s") + "\\n\\n" + tr("Arquivos baixados (%d):") + "\\n\\n%s%s")
+                                    % (ok, err, outdir, len(files), preview, suffix))
+            else:
+                messagebox.showinfo(tr("Concluído — %s") % mode.upper(),
+                                    tr("Sucesso: %d | Falhas: %d
+Nenhum arquivo listado.") % (ok, err))
+            try:
+                if self.auto_open_folder.get() or messagebox.askyesno(tr("Concluído — %s") % mode.upper(), tr("Deseja abrir a pasta dos arquivos agora?")):
+                    try: os.startfile(outdir)
+                    except Exception: webbrowser.open(outdir)
+            except Exception:
+                pass
+        try:
+            def _reset():
+            try:
+                self.reset_session()
+            finally:
+                pass
+        self.after(0, _show)
+        self.after(0, _reset)
+        except Exception:
+            _show()
+        # --- Limpeza de estado p/ próxima execução ---
+        try:
+            self.worker = None
+            self.progress["value"] = 0
+            self.lbl_status.configure(text=tr("Aguardando…"))
+        except Exception:
+            pass
+
 
 def run_app():
     app = App()
